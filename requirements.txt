@@ -4,7 +4,7 @@ argparse
 termcolor
 packaging==25.0
 torch==2.4.0
-vllm==0.6.2  
+vllm==0.8.5  
 transformers==4.49.0
 pybind11==2.12.0
 
