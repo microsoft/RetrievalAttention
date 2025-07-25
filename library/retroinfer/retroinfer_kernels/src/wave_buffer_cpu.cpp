@@ -34,6 +34,15 @@ class ThreadPool {
         }
 };
 
+struct CacheMetadata {
+  int64_t key = 0;
+  uint16_t score = 0;
+  bool operator<(const CacheMetadata &other) const {
+    if (score == other.score)
+      return key < other.key;
+    return score < other.score;
+  }
+};
 
 struct ClusterDescriptor {
     bool inBlockCache = false;      // whether the cluster is in the block cache
@@ -41,7 +50,8 @@ struct ClusterDescriptor {
     int CPUStartIndex = 0;          // start CPU vector index of the cluster
     int BlockNum = 0;               // number of blocks of the cluster
     int LastBlockSize = 0;          // valid vector number of the last block (only last block may be not full)
-    std::list<int64_t>::iterator LRUEntryPointer; // pointer for the cluster in the LRU list
+    // std::list<int64_t>::iterator LRUEntryPointer; // pointer for the cluster in the LRU list
+    std::set<CacheMetadata>::iterator EntryPointer;
 };
 
 
@@ -53,14 +63,17 @@ private:
     const int max_consider_block;   // max consider block number for each group
     ClusterDescriptor* cluster_descriptors; // cluster descriptors
     std::unordered_set<int> free_block_ids; // free block ids
-    std::list<int64_t> lru_keys;            // LRU list for recently used keys
+    // std::list<int64_t> lru_keys;            // LRU list for recently used keys
+    std::set<CacheMetadata> cache;
+    std::set<CacheMetadata> evicted;
 
     int miss_num = 0;                   // number of missing keys
     int hit_num = 0;                    // number of hit keys
     int64_t* _miss_keys = nullptr;      // missing keys
     int64_t* _hit_keys = nullptr;       // hit keys
+    const uint16_t size_weight = 4;
 
-    inline void removeLeastRecentlyUsed() noexcept {
+    /*inline void removeLeastRecentlyUsed() noexcept {
         if (lru_keys.empty()) return;
 
         // find the least recently used key
@@ -73,6 +86,25 @@ private:
 
         // set to miss
         cluster_descriptors[lru_key].inBlockCache = false;
+    }*/
+    inline void removeLeastScore() noexcept {
+      if (cache.empty())
+        return;
+
+      auto iter = cache.begin();
+      auto target_key = iter->key;
+      auto nh = cache.extract(iter);
+
+      // add to evicted
+      evicted.insert(std::move(nh));
+
+      // collect its block ids
+      int *block_ids = cluster_descriptors[target_key].GPUBlockIDs;
+      free_block_ids.insert(
+          block_ids, block_ids + cluster_descriptors[target_key].BlockNum);
+
+      // set to miss
+      cluster_descriptors[target_key].inBlockCache = false;
     }
 
 public:
@@ -93,7 +125,8 @@ public:
 
     ~BufferManager() {
         free_block_ids.clear();
-        lru_keys.clear();
+        // lru_keys.clear();
+        cache.clear();
         if (_miss_keys != nullptr) delete[] _miss_keys;
         if (_hit_keys != nullptr) delete[] _hit_keys;
         cluster_descriptors = nullptr;
@@ -103,7 +136,7 @@ public:
         int* update_block_ids, int* update_block_sizes, int* update_block_sizes_cumsum
     ) noexcept {
         // reverse iterate over the hit keys and update the LRU order.
-        for (int i = hit_num - 1; i >= 0; --i) {
+        /*for (int i = hit_num - 1; i >= 0; --i) {
             const int64_t& key = _hit_keys[i];
             auto& cluster_descriptor = cluster_descriptors[key];
 
@@ -111,6 +144,20 @@ public:
             lru_keys.erase(cluster_descriptor.LRUEntryPointer);
             lru_keys.push_front(key);
             cluster_descriptor.LRUEntryPointer = lru_keys.begin();
+        }*/
+        for (int i = hit_num - 1; i >= 0; --i) {
+          const int64_t &key = _hit_keys[i];
+          auto &cluster_descriptor = cluster_descriptors[key];
+
+          auto next_it = std::next(cluster_descriptor.EntryPointer);
+          auto nh = cache.extract(cluster_descriptor.EntryPointer);
+
+          // update score
+          nh.value().score += 10;
+
+          // use next_it as hint for insertion
+          auto new_it = cache.insert(next_it, std::move(nh));
+          cluster_descriptor.EntryPointer = new_it;
         }
 
         int admiss_num = 0;             // number of admissible keys
@@ -138,7 +185,8 @@ public:
 
         // evict to ensure the have enough space for the admissible keys
         while (free_block_ids.size() < static_cast<size_t>(total_blocks_needed)) {
-            removeLeastRecentlyUsed();
+            // removeLeastRecentlyUsed();
+            removeLeastScore();
         }
 
         // insert the admissible keys into the cache
@@ -172,8 +220,22 @@ public:
             update_block_num++;
 
             // update LRU order
-            lru_keys.push_front(key);
-            cluster_descriptor.LRUEntryPointer = lru_keys.begin();
+            // lru_keys.push_front(key);
+            // cluster_descriptor.LRUEntryPointer = lru_keys.begin();
+            if (evicted.empty()) {
+              auto it = cache.insert(
+                  cache.begin(),
+                  CacheMetadata{key, 110 - size_weight *
+                                               cluster_descriptor.BlockNum});
+              cluster_descriptor.EntryPointer = it;
+            } else {
+              auto nh = evicted.extract(evicted.begin());
+              nh.value().key = key;
+              nh.value().score =
+                  110 - size_weight * cluster_descriptor.BlockNum;
+              auto it = cache.insert(cache.begin(), std::move(nh));
+              cluster_descriptor.EntryPointer = it;
+            }
         }
 
         // if (update_block_num != total_blocks_needed) {
