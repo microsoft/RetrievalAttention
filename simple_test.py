@@ -33,6 +33,8 @@ def parse_args():
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
     parser.add_argument("--data_path", type=str, default="", help="Input json file path")
+    parser.add_argument("--data_id", type=int)
+    parser.add_argument("--nprobes", type=float)
     args = parser.parse_args()
     
     return args
@@ -55,7 +57,7 @@ def load_model(model_name, max_len, dtype, device):
     return llm
 
 
-def generate_config(model_name, context_len, attn_type):
+def generate_config(model_name, context_len, attn_type, nprobes):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
     CONFIG_FILE = os.path.join(CONFIG_DIR, MODEL_NAME)
@@ -74,7 +76,7 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe
-        original_config[attn_type]['cache_cluster_num'] = nprobe*3
+        original_config[attn_type]['cache_cluster_num'] = int(nprobe*nprobes)
         original_config[attn_type]['max_compute_cluster_num'] = max(int(n_clusters/4), nprobe)
     
     if attn_type != "Full_Flash_Attn":
@@ -103,9 +105,9 @@ if __name__ == "__main__":
     data = json.load(open(TEST_FILE))   # [{"input": str, "outputs": str}, ...]
     prompt = []
     groundtruth = []
-    for dd in data:
-        prompt.append(dd['input'])
-        groundtruth.append(dd['outputs'])
+    # for dd in data:
+    prompt.append(data[args.data_id]['input'])
+    groundtruth.append(data[args.data_id]['outputs'])
     
     # copy to fit batch size
     copy_round = math.ceil(batch_size/len(prompt))
@@ -131,9 +133,9 @@ if __name__ == "__main__":
     print(colored(f"Input length: {input_len}", 'yellow'))
 
     if data_path == "":
-        attn_config = generate_config(model_name, 122880, attn_type)
+        attn_config = generate_config(model_name, 122880, attn_type, args.nprobes)
     else:
-        attn_config = generate_config(model_name, input_len, attn_type)
+        attn_config = generate_config(model_name, input_len, attn_type, args.nprobes)
 
     llm = load_model(model_name, max_len, dtype, device)
     out = llm.generate(attention_type=attn_type,

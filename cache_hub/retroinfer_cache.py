@@ -112,8 +112,8 @@ class retroinfer_cache(KV_Cache):
         # initialize the CPU Wave Buffer
         self.wave_buffer = [WaveBufferCPU(
             self.batch_size, self.kv_head, self.head_dim, self.nprobe, self.page_size, self.n_centroids, 
-            self.n_centroids+self.n_centroids_new, self.buffer_size, self.cache_size, self.core, thread_pool_pointer)
-            for _ in range(self.layer_num)
+            self.n_centroids+self.n_centroids_new, self.buffer_size, self.cache_size, self.core, thread_pool_pointer, layer_id)
+            for layer_id in range(self.layer_num)
         ]
 
         # pin memory indices for hit clusters
