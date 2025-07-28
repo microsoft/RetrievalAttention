@@ -1,6 +1,6 @@
 #!/bin/bash
 
-output_dir="traces_rep_new_with_time_miss_rate"
+output_dir="traces_rep_new_score_with_miss_rate"
 
 while getopts "d:" opt; do
     case $opt in
