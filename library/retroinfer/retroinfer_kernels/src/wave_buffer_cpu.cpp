@@ -51,7 +51,6 @@ struct ClusterDescriptor {
     int CPUStartIndex = 0;          // start CPU vector index of the cluster
     int BlockNum = 0;               // number of blocks of the cluster
     int LastBlockSize = 0;          // valid vector number of the last block (only last block may be not full)
-    // std::list<int64_t>::iterator LRUEntryPointer; // pointer for the cluster in the LRU list
     std::set<CacheMetadata>::iterator EntryPointer; // The pointer to the set element
 };
 
@@ -65,20 +64,13 @@ private:
     ClusterDescriptor* cluster_descriptors; // cluster descriptors
     std::unordered_set<int> free_block_ids; // free block ids
     std::set<CacheMetadata> cache; // The cache
-    /*std::vector<
-        std::_Node_handle<CacheMetadata, CacheMetadata,
-                          std::allocator<std::_Rb_tree_node<CacheMetadata>>> *>
-        evicted; // The evicted entries*/ 
     std::vector<std::set<CacheMetadata>::node_type> evicted; // The evicted entries
-    // std::chrono::nanoseconds total_evict_duration = std::chrono::nanoseconds::zero(); // Eviction
-    // std::chrono::nanoseconds total_update_duration = std::chrono::nanoseconds::zero(); // Update
-    // std::chrono::nanoseconds total_insert_duration = std::chrono::nanoseconds::zero(); // Insertion
 
     int miss_num = 0;                   // number of missing keys
     int hit_num = 0;                    // number of hit keys
     int64_t* _miss_keys = nullptr;      // missing keys
     int64_t* _hit_keys = nullptr;       // hit keys
-    const uint16_t size_weight = 4;
+    const uint16_t thermal_impact = 4;
 
     inline void removeLeastRecentlyUsed() noexcept {
         if (cache.empty())
@@ -88,12 +80,8 @@ private:
         auto target_key = iter->key;
         auto nh = cache.extract(iter);
 
-        // add to evicted
-        //if (!evicted.empty())
-        //    nh.value().score = (--evicted.end())->score + 1;
-        // printf("Here_a\n");
         evicted.push_back(std::move(nh));
-        // printf("Here_b\n");
+
         // collect its block ids
         int* block_ids = cluster_descriptors[target_key].GPUBlockIDs;
         free_block_ids.insert(block_ids, block_ids + cluster_descriptors[target_key].BlockNum);
@@ -125,16 +113,13 @@ public:
         if (_miss_keys != nullptr) delete[] _miss_keys;
         if (_hit_keys != nullptr) delete[] _hit_keys;
         cluster_descriptors = nullptr;
-        /*std::cout << "insert: " << total_insert_duration.count() << " ns" << std::endl;
-        std::cout << "update: " << total_update_duration.count() << " ns" << std::endl;
-        std::cout << "evict: " << total_evict_duration.count() << " ns" << std::endl;*/
+
     }
 
     inline std::tuple<int, int> batch_update(
         int* update_block_ids, int* update_block_sizes, int* update_block_sizes_cumsum
     ) noexcept {
         // reverse iterate over the hit keys and update the LRU order.
-        // auto update_start = std::chrono::high_resolution_clock::now();
         for (int i = hit_num - 1; i >= 0; --i) {
             const int64_t& key = _hit_keys[i];
             auto& cluster_descriptor = cluster_descriptors[key];
@@ -149,8 +134,7 @@ public:
             auto new_it = cache.insert(next_it, std::move(nh));
             cluster_descriptor.EntryPointer = new_it;
         }
-        /*auto update_end = std::chrono::high_resolution_clock::now();
-        total_update_duration += std::chrono::duration_cast<std::chrono::nanoseconds>(update_end - update_start);*/
+
 
         int admiss_num = 0;             // number of admissible keys
         int total_blocks_needed = 0;    // total number of blocks needed for cache update
@@ -174,13 +158,10 @@ public:
             hit_num = 0;
             return { 0, 0 };
         }
-        // auto evict_start = std::chrono::high_resolution_clock::now();
         // evict to ensure the have enough space for the admissible keys
         while (free_block_ids.size() < static_cast<size_t>(total_blocks_needed)) {
             removeLeastRecentlyUsed();
         }
-        /*auto evict_end = std::chrono::high_resolution_clock::now();
-        total_evict_duration += std::chrono::duration_cast<std::chrono::nanoseconds>(evict_end - evict_start);*/
 
         // insert the admissible keys into the cache
         int update_block_num = 0;
@@ -214,43 +195,20 @@ public:
             update_block_num++;
 
             if (evicted.empty()) {
-                auto it = cache.insert(cache.begin(), CacheMetadata{key, 110 - size_weight * cluster_descriptor.BlockNum});
-                cluster_descriptor.EntryPointer = it;
+              auto it = cache.insert(
+                  cache.begin(),
+                  CacheMetadata{key, 110 - thermal_impact *
+                                               cluster_descriptor.BlockNum});
+              cluster_descriptor.EntryPointer = it;
             } else {
-              // printf("Here_c, %d\n",evicted.size());
-              /*auto *a = (std::_Node_handle<
-                         CacheMetadata, CacheMetadata,
-                         std::allocator<std::_Rb_tree_node<CacheMetadata>>> *)
-                            evicted.back();
-              evicted.pop_back();
-              //std::_Node_handle<
-                  CacheMetadata, CacheMetadata,
-                  std::allocator<std::_Rb_tree_node<CacheMetadata>>>
-                  nh = std::move(*a);
-              printf("Here_d, %d,%d\n", evicted.size(), a->value());
-              a->value().key = key;
-              printf("d1\n");
-              a->value().score =
-                  110 - size_weight * cluster_descriptor.BlockNum;
-              printf("d2\n");
-              auto it = cache.insert(cache.begin(), std::move(*a));
-              printf("Here_e\n");*/
-
-              //auto nh = evicted.back();
-              //evicted.pop_back();
               evicted.back().value().key = key;
               evicted.back().value().score =
-                  110 - size_weight * cluster_descriptor.BlockNum;
+                  110 - thermal_impact * cluster_descriptor.BlockNum;
               auto it = cache.insert(cache.begin(), std::move(evicted.back()));
               evicted.pop_back();
               cluster_descriptor.EntryPointer = it;
             }
         }
-        /*auto insert_end = std::chrono::high_resolution_clock::now();
-        total_insert_duration += std::chrono::duration_cast<std::chrono::nanoseconds>(insert_end - insert_start);*/
-        // if (update_block_num != total_blocks_needed) {
-        //     throw std::runtime_error("Update block ids size mismatch!");
-        // }
 
         // reset
         miss_num = 0;
@@ -400,11 +358,8 @@ public:
     int64_t output_seq_length;
 
 
-    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int block_size, 
-        // int n_centroids, int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool, int wave_buffer_id)
-        int n_centroids, int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool)
+    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int block_size, int n_centroids, int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool)
      : batch_size(batch_size), group_num(group_num), dim(dim), nprobe(nprobe), block_size(block_size),
-     // n_centroids(n_centroids), final_n_centroids(final_n_centroids), buffer_size(buffer_size), capacity(capacity), pool_(pool), wave_buffer_id(wave_buffer_id) {
      n_centroids(n_centroids), final_n_centroids(final_n_centroids), buffer_size(buffer_size), capacity(capacity), pool_(pool) {
         batch_groups = batch_size * group_num;
         // count valid threads
@@ -517,37 +472,6 @@ public:
         update_cache_indices = nullptr;
         update_block_nums = nullptr;
 
-        /*int total_hit = 0;
-        int total_access = 0;
-        for (auto &pair : miss_stats) {
-            total_hit += pair.first;
-            total_access += pair.second;
-        }
-        if (wave_buffer_id == 0) {
-            std::cout << std::setprecision(4) << "miss rate: "
-                        << 1 - float(miss_stats[0].first) / float(miss_stats[0].second)
-                        << std::endl;
-            std::cout << std::setprecision(4) << "access: " << miss_stats[0].second
-                        << std::endl;
-            std::cout << std::setprecision(4) << "hits: " << miss_stats[0].first
-                        << std::endl;
-        }
-        int block_total_hit = 0;
-        int block_total_access = 0;
-        for (auto &pair : block_miss_stats) {
-            block_total_hit += pair.first;
-            block_total_access += pair.second;
-        }
-        if (wave_buffer_id == 0) {
-            std::cout << std::setprecision(4) << "block miss rate: "
-                        << 1 - float(block_miss_stats[0].first) /
-                                float(block_miss_stats[0].second)
-                        << std::endl;
-            std::cout << std::setprecision(4)
-                        << "block access: " << block_miss_stats[0].second << std::endl;
-            std::cout << std::setprecision(4)
-                        << "block hits: " << block_miss_stats[0].first << std::endl;
-        }*/
     }
 
 
@@ -865,10 +789,6 @@ public:
             hit_block_nums[i] = hit_block_num;
             miss_block_nums[i] = miss_block_num;
 
-            /*miss_stats[i].first += hit_num;
-            miss_stats[i].second += hit_num + miss_num;
-            block_miss_stats[i].first += hit_block_num;
-            block_miss_stats[i].second += hit_block_num + miss_block_num;*/
         }
     }
 
@@ -938,10 +858,6 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<WaveBufferCPU>(m, "WaveBufferCPU")
-        /*.def(py::init<int, int, int, int, int, int, int, int, int, int, MyThreadPool*, int>(),
-             py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("block_size"), 
-             py::arg("n_centroids"), py::arg("final_n_centroids"), py::arg("buffer_size"), py::arg("capacity"), 
-             py::arg("threads"), py::arg("pool"), py::arg("wave_buffer_id"))*/
         .def(py::init<int, int, int, int, int, int, int, int, int, int, MyThreadPool*>(),
              py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("block_size"), 
              py::arg("n_centroids"), py::arg("final_n_centroids"), py::arg("buffer_size"), py::arg("capacity"), 
