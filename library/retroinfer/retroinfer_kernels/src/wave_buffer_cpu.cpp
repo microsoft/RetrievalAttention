@@ -44,6 +44,7 @@ struct CacheMetadata {
   }
 };
 
+
 struct ClusterDescriptor {
     bool inBlockCache = false;      // whether the cluster is in the block cache
     int* GPUBlockIDs = nullptr;     // GPU block ids of the cluster, can be incontiguous
@@ -64,7 +65,11 @@ private:
     ClusterDescriptor* cluster_descriptors; // cluster descriptors
     std::unordered_set<int> free_block_ids; // free block ids
     std::set<CacheMetadata> cache; // The cache
-    std::set<CacheMetadata> evicted; // The evicted entries
+    /*std::vector<
+        std::_Node_handle<CacheMetadata, CacheMetadata,
+                          std::allocator<std::_Rb_tree_node<CacheMetadata>>> *>
+        evicted; // The evicted entries*/ 
+    std::vector<std::set<CacheMetadata>::node_type> evicted; // The evicted entries
     // std::chrono::nanoseconds total_evict_duration = std::chrono::nanoseconds::zero(); // Eviction
     // std::chrono::nanoseconds total_update_duration = std::chrono::nanoseconds::zero(); // Update
     // std::chrono::nanoseconds total_insert_duration = std::chrono::nanoseconds::zero(); // Insertion
@@ -84,10 +89,11 @@ private:
         auto nh = cache.extract(iter);
 
         // add to evicted
-        if (!evicted.empty())
-            nh.value().score = (--evicted.end())->score + 1;
-        evicted.insert(evicted.end(), std::move(nh));
-
+        //if (!evicted.empty())
+        //    nh.value().score = (--evicted.end())->score + 1;
+        // printf("Here_a\n");
+        evicted.push_back(std::move(nh));
+        // printf("Here_b\n");
         // collect its block ids
         int* block_ids = cluster_descriptors[target_key].GPUBlockIDs;
         free_block_ids.insert(block_ids, block_ids + cluster_descriptors[target_key].BlockNum);
@@ -105,6 +111,7 @@ public:
         for (int i = 0; i < capacity; ++i) {
             free_block_ids.insert(i);
         }
+        evicted.reserve(20);
 
         _miss_keys = new int64_t[nprobe];
         _hit_keys = new int64_t[nprobe];
@@ -210,11 +217,33 @@ public:
                 auto it = cache.insert(cache.begin(), CacheMetadata{key, 110 - size_weight * cluster_descriptor.BlockNum});
                 cluster_descriptor.EntryPointer = it;
             } else {
-                auto nh = evicted.extract(evicted.begin());
-                nh.value().key = key;
-                nh.value().score = 110 - size_weight * cluster_descriptor.BlockNum;
-                auto it = cache.insert(cache.begin(), std::move(nh));
-                cluster_descriptor.EntryPointer = it;
+              // printf("Here_c, %d\n",evicted.size());
+              /*auto *a = (std::_Node_handle<
+                         CacheMetadata, CacheMetadata,
+                         std::allocator<std::_Rb_tree_node<CacheMetadata>>> *)
+                            evicted.back();
+              evicted.pop_back();
+              //std::_Node_handle<
+                  CacheMetadata, CacheMetadata,
+                  std::allocator<std::_Rb_tree_node<CacheMetadata>>>
+                  nh = std::move(*a);
+              printf("Here_d, %d,%d\n", evicted.size(), a->value());
+              a->value().key = key;
+              printf("d1\n");
+              a->value().score =
+                  110 - size_weight * cluster_descriptor.BlockNum;
+              printf("d2\n");
+              auto it = cache.insert(cache.begin(), std::move(*a));
+              printf("Here_e\n");*/
+
+              //auto nh = evicted.back();
+              //evicted.pop_back();
+              evicted.back().value().key = key;
+              evicted.back().value().score =
+                  110 - size_weight * cluster_descriptor.BlockNum;
+              auto it = cache.insert(cache.begin(), std::move(evicted.back()));
+              evicted.pop_back();
+              cluster_descriptor.EntryPointer = it;
             }
         }
         /*auto insert_end = std::chrono::high_resolution_clock::now();
