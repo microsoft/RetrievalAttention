@@ -23,7 +23,7 @@ conda activate retroinfer
 
 # install conda packages
 conda install -y mkl
-conda install -c conda-forge libstdcxx-ng cmake -y
+conda install -c conda-forge libstdcxx-ng -y
 
 # may need to downgrade pip to <=25.0 to solve `DEPRECATION warning` when using `pip install .` to install kernels
 python -m pip install pip==25.0
