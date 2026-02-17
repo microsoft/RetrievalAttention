@@ -41,10 +41,10 @@ cd library/
 git clone https://github.com/NVIDIA/cutlass.git
 cd retroinfer && pip install . && cd ..
 
-# if you want to use MInference, install the following package:
+# If you want to use MInference, install the following package:
 pip install minference==0.1.6.0
 
-# if you want to use XAttention, install the following kernels:
+# If you want to use XAttention, install the following kernels:
 git clone https://github.com/mit-han-lab/Block-Sparse-Attention.git 
 cd Block-Sparse-Attention && git checkout 0e2478b0a4d9858cf0910f78a8aaf4fba751de69 && export MAX_JOBS=8 && python setup.py install && cd ..
 
@@ -186,10 +186,10 @@ bash run.sh
 
 ## :clipboard: Add New Sparsity Methods
 This repository provides a flexible inference framework that allows users to easily integrate new sparsity-based attention methods. To add a new sparsity method, you can follow these steps: 
-1. Add your KV Cache management logic in `cache_hub/` directory.
+1. Add your KV cache management logic in `cache_hub/` directory.
 2. Add your attention computation logic in `attn_hub/` directory.
 3. Update [config.py](./config/config.py) to include configuration options for your new method.
-4. Update `init_kv_cache()`, `decode_attention()` and `parameter_move()` fuctions in [llama.py](./model_hub/llama.py) and [qwen.py](./model_hub/qwen.py) to incorporate your new method.
+4. Update `init_kv_cache()`, `decode_attention()` and `parameter_move()` functions in [llama.py](./model_hub/llama.py) and [qwen.py](./model_hub/qwen.py) to incorporate your new method.
 5. Now you can try your new sparsity method by specifying it in the `--attn_type` argument when running the scripts.
 
 ## :bulb: Reference
@@ -217,7 +217,6 @@ If you find this project helpful, please cite our papers:
 ```
 
 ## Contributing
-
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
 Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
 the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
@@ -231,7 +230,6 @@ For more information see the [Code of Conduct FAQ](https://opensource.microsoft.
 contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
 
 ## Trademarks
-
 This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
 trademarks or logos is subject to and must follow 
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
