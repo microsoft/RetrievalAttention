@@ -18,67 +18,52 @@ class flash_attn_cache(KV_Cache):
         head_dim: int,
         dtype: torch.dtype,
         layer_mapping: dict,
+        prefill_bsz: int,
         num_gpus: int,
         model_size: int
     ) -> None:
-        super().__init__(layer_num, batch_size, max_length, num_key_value_heads, num_heads, head_dim, dtype, layer_mapping, num_gpus, model_size)
+        super().__init__(layer_num, batch_size, max_length, num_key_value_heads, num_heads, head_dim, dtype, layer_mapping, prefill_bsz, num_gpus, model_size)
+        self.device_list = sorted(set(self.layer_mapping.values()), key=lambda x: int(x.split(':')[-1]))
 
-        self.valid_start = valid_start  # start index of valid tokens for each batch
-        self.valid_length = None        # valid seq length of each batch
-        self.batch_indices = torch.arange(self.batch_size, dtype=torch.int32, device=self.layer_mapping[str(0)])
+        self.valid_start_list = valid_start  # start index of valid tokens for each batch
+
+        self.valid_length = None     # valid seq length of each batch
+        self.valid_length_dict = {}  # allocate valid_length on each device
+
+        self.batch_indices_dict = {}
+        for device_idx in self.device_list:
+            self.batch_indices_dict[device_idx] = torch.arange(self.batch_size, dtype=torch.int32, device=device_idx)
+        self.batch_indices = self.batch_indices_dict[self.layer_mapping[str(0)]]
 
         self.allocated = self.pre_allocate_decision()
 
         if self.allocated:
             self.key_cache = [
-                torch.empty(
-                    self.batch_size,
-                    self.max_length,
-                    self.kv_head,
-                    self.head_dim,
-                    device=self.layer_mapping[str(ldx)],
-                    dtype=self.dtype
+                torch.zeros((self.batch_size, self.max_length, self.kv_head, self.head_dim),
+                    device=self.layer_mapping[str(ldx)], dtype=self.dtype
                 ) for ldx in range(self.layer_num)
             ]
             self.value_cache = [
-                torch.empty(
-                    self.batch_size,
-                    self.max_length,
-                    self.kv_head,
-                    self.head_dim,
-                    device=self.layer_mapping[str(ldx)],
-                    dtype=self.dtype
+                torch.zeros((self.batch_size, self.max_length, self.kv_head, self.head_dim),
+                    device=self.layer_mapping[str(ldx)], dtype=self.dtype
                 ) for ldx in range(self.layer_num)
             ]
         else:
             self.key_cache = [
-                torch.empty(
-                    self.batch_size,
-                    self.max_length,
-                    self.kv_head,
-                    self.head_dim,
-                    device='cpu',
-                    pin_memory=True,
-                    dtype=self.dtype
+                torch.empty((self.batch_size, self.max_length, self.kv_head, self.head_dim),
+                    device='cpu', pin_memory=True, dtype=self.dtype
                 ) for _ in range(self.layer_num)
             ]
             self.value_cache = [
-                torch.empty(
-                    self.batch_size,
-                    self.max_length,
-                    self.kv_head,
-                    self.head_dim,
-                    device='cpu',
-                    pin_memory=True,
-                    dtype=self.dtype
+                torch.empty((self.batch_size, self.max_length, self.kv_head, self.head_dim),
+                    device='cpu', pin_memory=True, dtype=self.dtype
                 ) for _ in range(self.layer_num)
             ]
 
         self.copystream = torch.cuda.Stream()
         self.copyevents = {}
         self.KVreadyevents = {}
-        device_list = sorted(set(self.layer_mapping.values()), key=lambda x: int(x.split(':')[-1]))
-        for device_idx in device_list:
+        for device_idx in self.device_list:
             with torch.cuda.device(device_idx):
                 self.copyevents[device_idx] = torch.cuda.Event()
                 self.KVreadyevents[device_idx] = torch.cuda.Event()
@@ -103,19 +88,22 @@ class flash_attn_cache(KV_Cache):
             key_states: (bsz, seq_len, kv_head, head_dim)
             value_states: (bsz, seq_len, kv_head, head_dim)
             layer_idx: the index of the layer
-            start_bdx: the start index of the batch (=batch_idx)
+            start_bdx: the start index of the batch
         """
         bsz, seq_len, _, _ = key_states.shape
-        assert bsz == 1, f"Multi-batch prefilling only support prefill single batch one by one."
-        assert seq_len <= self.max_length, f"Prefilling sequence length {seq_len} exceeds max length {self.max_length}."
-
-        self.KVreadyevents[self.layer_mapping[str(layer_idx)]].record()
+        assert bsz <= self.prefill_bsz, f"Prefilling batch size ({bsz}) should <= {self.prefill_bsz}."
+        assert seq_len <= self.max_length, f"Prefilling sequence length ({seq_len}) exceeds max length ({self.max_length})."
 
         if self.valid_length is None:
-            self.valid_length = torch.from_numpy(seq_len - self.valid_start).to(torch.int32).to(self.layer_mapping[str(0)])
+            temp_valid_length = torch.from_numpy(seq_len - self.valid_start_list).to(torch.int32)
+            for device_idx in self.device_list:
+                self.valid_length_dict[device_idx] = temp_valid_length.to(device_idx)
+            self.valid_length = self.valid_length_dict[self.layer_mapping[str(0)]]
         
-        _valid_start = self.valid_start[start_bdx]
+        _valid_start = self.valid_start_list[start_bdx]
         _valid_length = seq_len - _valid_start
+
+        self.KVreadyevents[self.layer_mapping[str(layer_idx)]].record()
 
         with torch.cuda.stream(self.copystream):
             self.KVreadyevents[self.layer_mapping[str(layer_idx)]].wait()    # wait for KV ready
@@ -129,7 +117,7 @@ class flash_attn_cache(KV_Cache):
         return key_states[:, _valid_start:, :, :], value_states[:, _valid_start:, :, :]
     
     def sync(self, layer_idx, start_bdx):
-        self.copyevents[self.layer_mapping[str(layer_idx)]].wait()  # wait for copy done
+        self.copyevents[self.layer_mapping[str(layer_idx)]].synchronize()  # wait for copy done
 
     
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):
@@ -140,12 +128,13 @@ class flash_attn_cache(KV_Cache):
             value_states: (bsz, seq_len(=1), kv_head, head_dim)
             layer_idx: the index of the layer
         """
-
         self.key_cache[layer_idx][self.batch_indices, self.valid_length, :, :] = key_states[:, 0, :, :]
         self.value_cache[layer_idx][self.batch_indices, self.valid_length, :, :] = value_states[:, 0, :, :]
         
         if layer_idx == self.layer_num - 1:
             self.context += 1
-            self.valid_length += 1
+            for device_idx in self.device_list:
+                self.valid_length_dict[device_idx] += 1
+            self.valid_length = self.valid_length_dict[self.layer_mapping[str(layer_idx)]]
         
         return self.key_cache[layer_idx], self.value_cache[layer_idx]

@@ -402,6 +402,11 @@ FodyWeavers.xsd
 build/
 dist/
 library/cutlass
-benchmark/LongBench/results/
+library/Block-Sparse-Attention
+benchmark/longbench/results/
 benchmark/ruler/data/synthetic/json/*.json
 benchmark/ruler/ruler_eval_result/
+benchmark/reasoning/outputs
+
+!benchmark/reasoning/data/**/*.jsonl
+!asserts/*.png

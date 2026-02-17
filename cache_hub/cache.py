@@ -16,6 +16,7 @@ class KV_Cache:
         head_dim: int,
         dtype: torch.dtype,
         layer_mapping: dict,
+        prefill_bsz: int,
         num_gpus: int,
         model_size: int
     ) -> None:
@@ -29,6 +30,7 @@ class KV_Cache:
             head_dim (int)
             dtype (torch.dtype)
             layer_mapping (dict)
+            prefill_bsz (int)
             num_gpus (int)
             model_size (int)
         """
@@ -41,6 +43,7 @@ class KV_Cache:
         self.head_dim = head_dim
         self.dtype = dtype
         self.layer_mapping = layer_mapping
+        self.prefill_bsz = min(prefill_bsz, batch_size)
         self.context = 0
 
         # estimate free GPU memory when prefilling
@@ -51,9 +54,9 @@ class KV_Cache:
         # model weight consumption
         model_weight_consumption = self.model_size * 2
         # prefill consumption for single GPU
-        prefill_consumption = self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # hidden
-        prefill_consumption += self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # residual
-        prefill_consumption += (self.num_heads + 2*self.kv_head) * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # qkv
-        prefill_consumption += 4 * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # temp
+        prefill_consumption = self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # hidden
+        prefill_consumption += self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # residual
+        prefill_consumption += self.prefill_bsz * (self.num_heads + 2*self.kv_head) * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # qkv
+        prefill_consumption += 4 * self.prefill_bsz * self.num_heads * self.max_length * self.head_dim * 2 / 1024 / 1024 / 1024 # temp
         # free memory during prefill
         self.free_memory = total_gpu_memory - model_weight_consumption - prefill_consumption*self.num_gpus

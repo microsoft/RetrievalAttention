@@ -2,8 +2,9 @@ import torch
 import numpy as np
 import time
 import math
-from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors
 import random
+from retroinfer_kernels import gather_copy_and_concat, gather_copy_and_scatter, gather_copy_vectors, reorganize_vectors, gather_copy_cluster_and_concat_fuse
+
 
 DTYPE = torch.bfloat16
 
@@ -77,6 +78,8 @@ def test_concat_gather_copy():
     copy_vector_num = 1602
     buffer_vector_num = buffer_unit_num * unit_size + src_vector_num1
 
+    copy_vector_num_tensor = torch.tensor(copy_vector_num, dtype=torch.int32, device='cuda')
+
     key_src1 = torch.randn((groups, src_vector_num1, dim), device='cuda', dtype=DTYPE).contiguous()
     key_src2 = torch.randn((groups, src_vector_num2, dim), pin_memory=True, dtype=DTYPE).contiguous()
     key_src3 = torch.randn((groups, src_unit_num3, unit_size, dim), device='cuda', dtype=DTYPE).contiguous()
@@ -100,7 +103,7 @@ def test_concat_gather_copy():
                            src_indices1, src_copy_size1, dst_indices1, copy_chunks1,
                            src_indices2, src_copy_size2, dst_indices2, copy_chunks2,
                            valid_lengths, groups, src_vector_num1, src_vector_num2, src_unit_num3, 
-                           buffer_vector_num, index_length, copy_vector_num)
+                           buffer_vector_num, index_length, copy_vector_num_tensor)
 
     torch.cuda.synchronize()
     print("cuda time: ", time.time()-t1)
@@ -169,6 +172,8 @@ def test_gather_copy_scatter():
     dim = 128
     copy_start = 97
 
+    copy_start_tensor = torch.tensor(copy_start, dtype=torch.int32, device='cuda')
+
     key_src = torch.randn((groups, src_unit_num*unit_size, dim), device='cuda', dtype=DTYPE).contiguous()
     key_dst1 = torch.randn((groups, dst_unit_num, unit_size, dim), device='cuda', dtype=DTYPE).contiguous()
     key_dst2 = key_dst1.clone()
@@ -183,7 +188,7 @@ def test_gather_copy_scatter():
     t1 = time.time()
     gather_copy_and_scatter(key_src, key_dst1, value_src, value_dst1, 
                             src_indices, src_copy_size, dst_indices, copy_chunks, 
-                            groups, src_unit_num*unit_size, dst_unit_num, index_length, copy_start)
+                            groups, src_unit_num*unit_size, dst_unit_num, index_length, copy_start_tensor)
     torch.cuda.synchronize()
     print("cuda time: ", time.time()-t1)
 
@@ -242,10 +247,165 @@ def test_gather_copy_vectors():
 
 
 
+def split_integer_sum(a, x):
+    # 从 [1, a] 中随机选择 x-1 个分割点
+    cuts = torch.sort(torch.randint(0, a, (x - 1,), dtype=torch.int32)).values
+    cuts = torch.cat([torch.tensor([0]), cuts, torch.tensor([a])])
+    return cuts[1:] - cuts[:-1]  # 每份 = 相邻切点之差
+
+def test_reorganize_vectors():
+    groups = 8
+    dst_vector_num = 102790
+    n_centroids = 3511
+    dim = 128
+    copy_cluster_num = 511
+    copy_start = torch.randint(0, n_centroids - copy_cluster_num + 1, (1,), dtype=torch.int32)[0].item()
+    # copy_start = 0
+    # copy_start = n_centroids - copy_cluster_num
+    print(copy_start)
+
+    cluster_sizes = torch.empty((groups, n_centroids), dtype=torch.int32, device='cuda')
+    for i in range(groups):
+        cluster_sizes[i] = split_integer_sum(dst_vector_num, n_centroids).to(dtype=torch.int32, device='cuda')
+    
+    cluster_cumsum = torch.cumsum(cluster_sizes, dim=1, dtype=torch.int32)
+    assert (cluster_cumsum[:, -1] == dst_vector_num).all(), f"{cluster_cumsum[:, -1]} != {dst_vector_num}"
+    cluster_start_indices = cluster_cumsum - cluster_sizes
+    
+    max_cluster_size = 0
+    src_vector_num = 0
+    for i in range(groups):
+        src_vector_num_group = 0
+        for j in range(copy_cluster_num):
+            max_cluster_size = max(max_cluster_size, cluster_sizes[i, copy_start+j].item())
+            src_vector_num_group += cluster_sizes[i, copy_start+j].item()
+        src_vector_num = max(src_vector_num, src_vector_num_group)
+    print(max_cluster_size, src_vector_num, (cluster_sizes[:, copy_start:copy_start+copy_cluster_num] == 0).any())
+
+    key_src = torch.randn((groups, src_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    key_dst1 = torch.randn((groups, dst_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    key_dst2 = key_dst1.clone()
+
+    value_src = torch.randn((groups, src_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    value_dst1 = torch.randn((groups, dst_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    value_dst2 = value_dst1.clone()
+    
+    clusters = torch.randint(-100, 2*src_vector_num, (groups, copy_cluster_num, max_cluster_size), dtype=torch.int32, device='cuda')
+    for i in range(groups):
+        random_indices = torch.randperm(src_vector_num, dtype=torch.int32, device='cuda')
+        start_idx = 0
+        for j in range(copy_cluster_num):
+            cluster_size = cluster_sizes[i, copy_start+j].item()
+            clusters[i, j, :cluster_size] = random_indices[start_idx:start_idx+cluster_size]
+            start_idx += cluster_size
+    
+    torch.cuda.synchronize()
+    start = time.time()
+    reorganize_vectors(key_src, key_dst1, value_src, value_dst1, clusters, cluster_cumsum, 
+                       groups, copy_start)
+    torch.cuda.synchronize()
+    print("cuda time: ", time.time()-start)
+
+    torch.cuda.synchronize()
+    start = time.time()
+    for i in range(groups):
+        for j in range(copy_cluster_num):
+            copy_cluster_size = cluster_sizes[i, copy_start+j]
+            copy_start_index = cluster_start_indices[i, copy_start+j]
+            for k in range(copy_cluster_size):
+                key_dst2[i, copy_start_index+k, :] = key_src[i, clusters[i, j, k], :]
+                value_dst2[i, copy_start_index+k, :] = value_src[i, clusters[i, j, k], :]
+    torch.cuda.synchronize()
+    print("torch time: ", time.time()-start)
+
+    assert (key_dst1 == key_dst2).all()
+    assert (value_dst1 == value_dst2).all()
+
+
+
+def test_gather_copy_cluster_and_concat_fuse(nprobe=70):
+    groups = 8
+    src_vector_num1 = 1769
+    src_vector_num2 = 32397
+    dim = 128
+
+    copy_vector_num = 1001
+    copy_vector_num_tensor = torch.tensor(copy_vector_num, dtype=torch.int32, device='cuda')
+
+    n_centroids = 2019
+    cluster_sizes = torch.empty((groups, n_centroids), dtype=torch.int32, device='cuda')
+    for i in range(groups):
+        cluster_sizes[i] = split_integer_sum(src_vector_num2, n_centroids).to(dtype=torch.int32, device='cuda')
+    cluster_cumsum = torch.cumsum(cluster_sizes, dim=-1, dtype=torch.int32)
+
+    index_size = 1787
+    select_indices = torch.randint(0, n_centroids, (groups, index_size), dtype=torch.int64, device='cuda')
+    select_indices[2, 0] = 0
+    select_indices[5, 0] = n_centroids - 1
+    nprobe_tensor = torch.tensor(nprobe, dtype=torch.int32, device='cuda')
+    
+    buffer_vector_num = nprobe * 18 + copy_vector_num
+    print(buffer_vector_num)
+    key_src1 = torch.randn((groups, src_vector_num1, dim), device='cuda', dtype=DTYPE).contiguous()
+    key_src2 = torch.randn((groups, src_vector_num2, dim), device='cuda', dtype=DTYPE).contiguous()
+    key_dst1 = torch.randn((groups, buffer_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    key_dst2 = key_dst1.clone()
+    
+    value_src1 = torch.randn((groups, src_vector_num1, dim), device='cuda', dtype=DTYPE).contiguous()
+    value_src2 = torch.randn((groups, src_vector_num2, dim), device='cuda', dtype=DTYPE).contiguous()
+    value_dst1 = torch.randn((groups, buffer_vector_num, dim), device='cuda', dtype=DTYPE).contiguous()
+    value_dst2 = value_dst1.clone()
+
+    valid_lengths = torch.empty((groups,), dtype=torch.int32, device='cuda')
+    
+    torch.cuda.synchronize()
+    t1 = time.time()
+    gather_copy_cluster_and_concat_fuse(key_src1, key_src2, key_dst1, value_src1, value_src2, value_dst1,
+                                        cluster_cumsum, select_indices, valid_lengths,
+                                        groups, src_vector_num1, src_vector_num2, buffer_vector_num, 
+                                        nprobe, nprobe_tensor, copy_vector_num_tensor)
+    torch.cuda.synchronize()
+    print("cuda time: ", time.time()-t1)
+
+    print("valid_lengths: ", valid_lengths)
+
+    for i in range(groups):
+        key_dst2[i, :copy_vector_num, :] = key_src1[i, :copy_vector_num, :]
+        value_dst2[i, :copy_vector_num, :] = value_src1[i, :copy_vector_num, :]
+        copy_num = copy_vector_num
+
+        for j in range(nprobe):
+            cluster_id = select_indices[i, j].item()
+            start_idx = 0 if cluster_id == 0 else cluster_cumsum[i, cluster_id-1].item()
+            end_idx = cluster_cumsum[i, cluster_id].item()
+            copy_size = end_idx - start_idx
+
+            flag = False
+            if copy_num + copy_size > buffer_vector_num:
+                print("overflow at group", i, "cluster", j)
+                flag = True
+                copy_size = max(0, buffer_vector_num - copy_num)
+
+            key_dst2[i, copy_num:copy_num+copy_size, :] = key_src2[i, start_idx:start_idx+copy_size, :]
+            value_dst2[i, copy_num:copy_num+copy_size, :] = value_src2[i, start_idx:start_idx+copy_size, :]
+            copy_num += copy_size
+
+            if flag: break
+        
+        assert copy_num == valid_lengths[i], f"{i, copy_num, valid_lengths[i]}"
+    
+    assert (key_dst1 == key_dst2).all()
+    assert (value_dst1 == value_dst2).all()
+
+
+
 if __name__ == "__main__":
-    for i in range(10):
+    for i in range(5):
         test_concat_gather_copy()
         test_gather_copy_scatter()
         test_gather_copy_vectors()
+        test_reorganize_vectors()
+        test_gather_copy_cluster_and_concat_fuse()
+        # for i in range(0, 150):
+        #     test_gather_copy_cluster_and_concat_fuse(i)
         print("pass")
-    

@@ -5,9 +5,12 @@
         "core": 22,
         "n_centroids": 8192,
         "n_segment": 16,
-        "nprobe": 150,
-        "max_compute_cluster_num": 2048,
-        "cache_unit_size": 8,
-        "cache_cluster_num": 450
+        "pages_per_cluster": 2,
+        "retrieval_budget": 0.018,
+        "estimation_budget": 0.232,
+        "cache_ratio": 0.05,
+        "buffer_cluster_num": 32,
+        "use_cuda_graph": false,
+        "gpu_only": false
     }
 }

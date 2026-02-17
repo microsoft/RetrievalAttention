@@ -7,4 +7,7 @@ bash run_different_models.sh
 echo "Running different tasks ..."
 bash run_different_tasks.sh
 
+echo "Running end2end test ..."
+bash run_e2e.sh
+
 echo "Done"
