@@ -1,0 +1,16 @@
+{
+    "RetroInfer": {
+        "static_pattern_start": 4,
+        "static_pattern_end": 64,
+        "core": 22,
+        "n_centroids": 8192,
+        "n_segment": 16,
+        "pages_per_cluster": 2,
+        "retrieval_budget": 0.018,
+        "estimation_budget": 0.232,
+        "cache_ratio": 0.05,
+        "buffer_cluster_num": 200,
+        "use_cuda_graph": false,
+        "gpu_only": false
+    }
+}

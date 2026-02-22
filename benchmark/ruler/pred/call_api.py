@@ -37,22 +37,21 @@ import os
 import sys
 import threading
 import importlib
-import time
 import torch
 import numpy as np
 import random
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 import traceback
 from utils import load_data
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.append(PROJECT_ROOT)
-from model_hub import LlamaModel, QwenModel
+from model_hub import LlamaModel, QwenModel, add_model_args
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from config import generate_config, parse_attn_args
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
+from config import add_config_args, generate_config
 
 
 SERVER_TYPES = (
@@ -63,6 +62,12 @@ SERVER_TYPES = (
     'hf',
     'mamba',
 )
+
+
+class ServerAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.server_type = values
+
 
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -75,7 +80,9 @@ def seed_everything(seed):
 
 
 class HuggingFaceModel:
-    def __init__(self, model_name, max_len, max_new_len, attn_type, dtype, device, budget_ratio, estimate_ratio, synthetic_len) -> None:
+    def __init__(self, model_name, max_len, max_new_len, attn_type, dtype, 
+                 device, retrieval_budget, estimation_budget, synthetic_len,
+                 args) -> None:
         if 'Llama' in model_name:
             llm = LlamaModel(model_name,
                 max_length=max_len+max_new_len,
@@ -92,11 +99,13 @@ class HuggingFaceModel:
         self.llm = llm
         self.max_new_len = max_new_len
         self.attn_type = attn_type
+        self.dtype = dtype
 
         self.model_name = model_name
-        self.budget_ratio = budget_ratio
-        self.estimate_ratio = estimate_ratio
+        self.retrieval_budget = retrieval_budget
+        self.estimation_budget = estimation_budget
         self.synthetic_len = synthetic_len
+        self.args = args
 
     def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
         generated_text = get_pred(
@@ -104,21 +113,19 @@ class HuggingFaceModel:
             input_text=prompt, 
             max_new_tokens=self.max_new_len,
             attn_type=self.attn_type,
+            dtype=self.dtype,
             model_name=self.model_name,
-            budget_ratio=self.budget_ratio,
-            estimate_ratio=self.estimate_ratio,
-            synthetic_len=self.synthetic_len
+            retrieval_budget=self.retrieval_budget,
+            estimation_budget=self.estimation_budget,
+            synthetic_len=self.synthetic_len,
+            args=self.args,
         )
-
         return {'text': [generated_text]}
 
 
-class ServerAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        namespace.server_type = values
-
-
-def get_llm(model_name, max_len, max_new_len, attn_type, dtype, device, budget_ratio, estimate_ratio, synthetic_len):
+def get_llm(model_name, max_len, max_new_len, attn_type, dtype, 
+            device, retrieval_budget, estimation_budget, synthetic_len,
+            args):
     if args.server_type == 'hf':
         llm = HuggingFaceModel(
             model_name=model_name,
@@ -127,9 +134,10 @@ def get_llm(model_name, max_len, max_new_len, attn_type, dtype, device, budget_r
             attn_type=attn_type,
             dtype=dtype,
             device=device,
-            budget_ratio=budget_ratio,
-            estimate_ratio=estimate_ratio,
+            retrieval_budget=retrieval_budget,
+            estimation_budget=estimation_budget,
             synthetic_len=synthetic_len,
+            args=args,
         ) 
     else:
         raise RuntimeError(f'Unsupported server type {args.server_type}')
@@ -142,12 +150,13 @@ def get_pred(
     input_text: str,
     max_new_tokens: int,
     attn_type: str,
+    dtype: torch.dtype,
     model_name: str,
-    budget_ratio: float,
-    estimate_ratio: float,
+    retrieval_budget: float,
+    estimation_budget: float,
     synthetic_len: int,
+    args,
 ) -> str:
-    
     llm.tokenizer.pad_token = llm.tokenizer.eos_token
     llm.tokenizer.padding_side = "left"
     inputs = llm.tokenizer([input_text], return_tensors="pt", padding=True)
@@ -158,19 +167,23 @@ def get_pred(
         model_name, 
         synthetic_len, 
         attn_type,
-        budget_ratio=budget_ratio,
-        estimate_ratio=estimate_ratio,
+        retrieval_budget=retrieval_budget,
+        estimation_budget=estimation_budget,
     )
 
-    out = llm.generate(attention_type=attn_type,
+    out = llm.generate(
+        attention_type=attn_type,
         inputs_ids = input_ids.to(llm.layers[0].device),
         attention_masks = attention_masks.to(llm.layers[0].device),
         max_new_length=max_new_tokens, 
-        attn_config=attn_config
+        attn_config=attn_config,
+        do_sample=False,
+        ignore_eos=True,
+        prefill_method=args.prefill_method,
     )
 
     output = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
-            
+    
     print("Chunked generation:", output[0])
     return output[0]
 
@@ -196,8 +209,6 @@ def get_output(llm, outputs_parallel, idx, index, input, outputs, others, trunca
 
 
 def main(args):
-    start_time = time.time()
-    
     curr_folder = os.path.dirname(os.path.abspath(__file__))
     
     try:
@@ -234,9 +245,15 @@ def main(args):
         data = load_data(task_file)
 
     # Load api
-    dtype = torch.float16 if args.dtype == 'fp16' else torch.bfloat16
-    llm = get_llm(args.model_name, args.max_len, config['tokens_to_generate'], args.attn_type, dtype, args.device, 
-                  budget_ratio=args.budget_ratio, estimate_ratio=args.estimate_ratio, synthetic_len=args.synthetic_len,)
+    dtype = torch.float16 if args.dtype=='fp16' else torch.bfloat16
+
+    assert args.max_len >= args.synthetic_len, \
+        f"max model length {args.max_len} should be no smaller than context length {args.synthetic_len}"
+    
+    llm = get_llm(args.model_name, args.max_len, config['tokens_to_generate'], 
+                  args.attn_type, dtype, args.device, 
+                  retrieval_budget=args.retrieval_budget, estimation_budget=args.estimation_budget, 
+                  synthetic_len=args.synthetic_len, args=args)
     
     threads = []
     outputs_parallel = [{} for _ in range(len(data))]
@@ -275,7 +292,7 @@ def main(args):
                 if len(outputs_parallel[computed_idx]) > 0:
                     fout.write(json.dumps(outputs_parallel[computed_idx]) + '\n')
 
-    print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -296,27 +313,16 @@ if __name__ == '__main__':
     parser.add_argument("--ssh_key_path", type=str)
 
     # Inference
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct",                                            \
-            choices=["Qwen/Qwen2.5-7B-Instruct", "gradientai/Llama-3-8B-Instruct-Gradient-1048k", "meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-72B-Instruct"], \
-            help="huggingface model name")
-    parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                      \
-            choices=["Full_Flash_Attn", "RetroInfer"],                                  \
-            help="Attention method")
     parser.add_argument("--max_len", type=int, default=128000)
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--dtype", type=str, default="fp16",choices=["fp16", "bf16"])
-
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_k", type=int, default=32)
-    parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--random_seed", type=int, default=0)
-    parser.add_argument("--sliding_window_size", type=int)
-    parser.add_argument("--threads", type=int, default=4)
-
     parser.add_argument("--synthetic_len", type=int, required=True)
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--random_seed", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--prefill_method", type=str, default="full", choices=["full", "xattn", "minfer"], 
+                        help="Prefilling method")
 
-    parser = parse_attn_args(parser)
+    parser = add_config_args(parser)
+    parser = add_model_args(parser)
 
     args = parser.parse_args()
     print(args)

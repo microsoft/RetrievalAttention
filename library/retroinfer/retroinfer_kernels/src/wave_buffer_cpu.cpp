@@ -48,7 +48,6 @@ struct ClusterDescriptor {
 class BufferManager {
 private:
     const int capacity;             // number of total blocks for LRU Cache
-    const int nprobe;               // max number for each batch access
     const int block_size;           // full vector number for one block
     const int max_consider_block;   // max consider block number for each group
     ClusterDescriptor* cluster_descriptors; // cluster descriptors
@@ -77,7 +76,7 @@ private:
 
 public:
     BufferManager(int capacity, int nprobe, int block_size, int max_consider_block, ClusterDescriptor* cluster_descriptors)
-     : capacity(capacity), nprobe(nprobe), block_size(block_size), max_consider_block(max_consider_block),
+     : capacity(capacity), block_size(block_size), max_consider_block(max_consider_block),
      cluster_descriptors(cluster_descriptors) {
         // set free block ids
         free_block_ids.reserve(capacity);
@@ -211,7 +210,7 @@ public:
             consider_block_num += cluster_descriptor.BlockNum;
             // ignore clusters that can not fit in the buffer
             if (consider_block_num > max_consider_block) {
-                printf("Warning: retrieved pages exceeds max consider pages, will skip the remaining clusters, please increase buffer_size to solve this.\n");
+                printf("Warning: retrieved pages exceeds max consider pages, will skip the remaining clusters, please increase buffer_cluster_num to solve this.\n");
                 break;
             }
             
@@ -260,46 +259,46 @@ public:
 
 class WaveBufferCPU {
 private:
-    const int batch_size;   // batch size
+    const int batch_size;   // total batch size
     const int group_num;    // kv_head_num
     int batch_groups;
     const int dim;          // dimension of the vector
 
-    const int nprobe;       // searched cluster number
+    int nprobe;             // searched cluster number
     const int block_size;   // full vector number for one block
-    int n_centroids;        // current number of clusters for each group
     const int final_n_centroids;  // final number of clusters for each group (since index may insert new data during decoding)
 
     const int buffer_size;  // max consider block number for each group
     const int capacity;     // cache capacity
 
-    int num_threads;        // thread number
-    int group_per_thread;   // groups per thread
+    int num_threads;        // used thread number
+    int group_per_thread;   // groups per thread for decoding and updating
+    int construct_groups_per_thread; // groups per thread for construction
 
     MyThreadPool* pool_;                    // thread pool
     std::vector<BufferManager*> caches;     // Buffer manager (LRU)
 
     ClusterDescriptor* cluster_descriptors; // cluster descriptors, (batch_size*group_num, final_n_centroids)
 
-    // (group_num, n_centroids), cumulative sum of the vector number of each cluster in each group
-    int* ivf_list_size_csum_array;
-
-    // pointer to the retrieved clusters, [group_num, nprobe]
+    // pointer to the retrieved clusters, [batch_size*group_num, nprobe]
     int64_t* searched_clusters_ptr;         
 
     // input data to re-organize keys & values based on the clustering results
+    // groups = prefill_bsz*group_num when build index during prefilling
+    // groups = batch_size*group_num when update index during decoding
     uint16_t* input_key_ptr;        // (groups, input_seq_length, dim)
     uint16_t* input_value_ptr;      // (groups, input_seq_length, dim)
     int* clusters_ptr;              // key id of each cluster in single batch, (groups, n_centroids, max_cluster_size)
     int* cluster_size_ptr;          // cluster size of each cluster in single batch, (groups, n_centroids)
     int64_t input_seq_length;
     int64_t max_cluster_size;
+    int current_start_batch = 0;    // current processing batch index
+    int process_groups = 0;         // clusters.shape[0] and cluster_size.shape[0]
+    int n_centroids = 0;            // clusters.shape[1] and cluster_size.shape[1]
 
-    int current_batch = 0;          // current processing batch index
-
-    // last sequence length of each group, [batch_size*group_num]
+    // last-round sequence length of each group, [batch_size*group_num]
     int* last_seq_lengths = nullptr;
-    // last number of clusters (before update)
+    // last-round number of clusters
     int last_n_centroids;
 
 public:
@@ -325,20 +324,18 @@ public:
     int64_t output_seq_length;
 
 
-    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int block_size, 
-        int n_centroids, int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool)
+    WaveBufferCPU(int batch_size, int group_num, int dim, int nprobe, int new_nprobe, int block_size, 
+        int final_n_centroids, int buffer_size, int capacity, int threads, MyThreadPool* pool)
      : batch_size(batch_size), group_num(group_num), dim(dim), nprobe(nprobe), block_size(block_size),
-     n_centroids(n_centroids), final_n_centroids(final_n_centroids), buffer_size(buffer_size), capacity(capacity), pool_(pool) {
+     final_n_centroids(final_n_centroids), buffer_size(buffer_size), capacity(capacity), pool_(pool) {
         batch_groups = batch_size * group_num;
-        // count valid threads
-        int min_group_per_thread = 2;
+        // count valid threads and groups per thread
+        int min_group_per_thread = 1;
         num_threads = std::min(threads, (batch_groups + min_group_per_thread - 1) / min_group_per_thread);
         group_per_thread = (batch_groups + num_threads - 1) / num_threads;
 
         ivf_key_array = nullptr;
         ivf_value_array = nullptr;
-        
-        current_batch = 0;
         
         input_key_ptr = nullptr;
         input_value_ptr = nullptr;
@@ -364,21 +361,25 @@ public:
 
         last_seq_lengths = new int[batch_groups];
         std::fill(last_seq_lengths, last_seq_lengths + batch_groups, 0);
-        last_n_centroids = n_centroids;
-
-        ivf_list_size_csum_array = new int[group_num * n_centroids];
+        last_n_centroids = 0;
 
         // store descriptor of each cluster
-        cluster_descriptors = new ClusterDescriptor[batch_groups * final_n_centroids];
-        for (int i = 0; i < batch_groups * final_n_centroids; ++i) {
-            cluster_descriptors[i].GPUBlockIDs = new int[PRE_ALLOCATED_NUM];    // pre-allocate memory
+        if (final_n_centroids == 0) {   // will not build index at all
+            cluster_descriptors = nullptr;
+        } else {
+            cluster_descriptors = new ClusterDescriptor[batch_groups * final_n_centroids];
+            for (int i = 0; i < batch_groups * final_n_centroids; ++i) {
+                cluster_descriptors[i].GPUBlockIDs = new int[PRE_ALLOCATED_NUM];    // pre-allocate memory
+            }
         }
 
         // prepare caches
         caches.resize(batch_groups, nullptr);
-        for (int i = 0; i < batch_groups; ++i) {
-            caches[i] = new BufferManager(capacity, nprobe, block_size, buffer_size,
-                                          cluster_descriptors + i * final_n_centroids);
+        if (final_n_centroids > 0) {
+            for (int i = 0; i < batch_groups; ++i) {
+                caches[i] = new BufferManager(capacity, nprobe+new_nprobe, block_size, buffer_size,
+                                              cluster_descriptors + i * final_n_centroids);
+            }
         }
     }
 
@@ -407,11 +408,6 @@ public:
             last_seq_lengths = nullptr;
         }
 
-        if (ivf_list_size_csum_array != nullptr) {
-            delete[] ivf_list_size_csum_array;
-            ivf_list_size_csum_array = nullptr;
-        }
-
         ivf_key_array = nullptr;
         ivf_value_array = nullptr;
 
@@ -437,7 +433,6 @@ public:
         update_cache_indices = nullptr;
         update_block_nums = nullptr;
     }
-
 
     void set_indices(
         torch::Tensor& hit_block_ids_tensor,
@@ -486,10 +481,10 @@ public:
     }
 
     void set_kv(
-        torch::Tensor& ivf_key_tensor,      // (bsz, groups, seq_len, dim)
-        torch::Tensor& ivf_value_tensor,    // (bsz, groups, seq_len, dim)
-        torch::Tensor& input_keys,          // (groups, seq_len, dim)
-        torch::Tensor& input_values         // (groups, seq_len, dim)
+        torch::Tensor& ivf_key_tensor,      // (batch_size, group_num, output_seq_len, dim)
+        torch::Tensor& ivf_value_tensor,    // (batch_size, group_num, output_seq_len, dim)
+        torch::Tensor& input_keys,          // (groups, input_seq_len, dim)
+        torch::Tensor& input_values         // (groups, input_seq_len, dim)
     ) {
         if (ivf_key_tensor.dtype() == torch::kFloat16) {     // fp16
             ivf_key_array = reinterpret_cast<uint16_t*>(ivf_key_tensor.data_ptr<at::Half>());
@@ -508,82 +503,74 @@ public:
 
 
 
-    // compute the cumsum of the block number of each cluster in group idx
-    // initialize the cluster descriptors
-    int parse_clusters(
-        int* lists_size,    // shape (n_centroids,), represent the length of each cluster
-        const int idx
-    ) {
-        // cumsum of the cluster size of each cluster
-        int* list_size_csum = ivf_list_size_csum_array + idx * static_cast<int64_t>(n_centroids);
-        // cluster descriptor of this group
-        auto cluster_descriptors_group = cluster_descriptors + (current_batch * group_num + idx) * static_cast<int64_t>(final_n_centroids);
-
-        int total_size = 0;
-        for (int i = 0; i < n_centroids; ++i) {
-            int list_size = lists_size[i];
-            // calculate the number of blocks for this cluster
-            const int block_num = (list_size + block_size - 1) / block_size;
-
-            // initialize the cluster descriptor
-            cluster_descriptors_group[i].inBlockCache = false;
-            if (block_num > PRE_ALLOCATED_NUM) {
-                delete[] cluster_descriptors_group[i].GPUBlockIDs;
-                cluster_descriptors_group[i].GPUBlockIDs = new int[block_num];  // allocate larger memory
-            }
-            cluster_descriptors_group[i].CPUStartIndex = total_size;
-            cluster_descriptors_group[i].BlockNum = block_num;
-            cluster_descriptors_group[i].LastBlockSize = list_size % block_size == 0 ? block_size : list_size % block_size;
-
-            total_size += list_size;
-            list_size_csum[i] = total_size;
-        }
-        return total_size;
-    }
-
     // organize the KV for each group
-    void organize_kv(void* para) {
-        int idx = reinterpret_cast<std::intptr_t>(para);
-
-        int* ivf_list_size_csum = ivf_list_size_csum_array + idx * static_cast<int64_t>(n_centroids);
-        int* invlists = clusters_ptr + idx * n_centroids * max_cluster_size;
-        int* invlists_size = cluster_size_ptr + idx * n_centroids;
-        uint16_t* values = input_value_ptr + idx * input_seq_length * dim;
-        uint16_t* keys = input_key_ptr + idx * input_seq_length * dim;
-        uint16_t* parse_key = ivf_key_array + (current_batch * group_num + idx) * output_seq_length * dim;
-        uint16_t* parse_value = ivf_value_array + (current_batch * group_num + idx) * output_seq_length * dim;
-
-        // organize keys & values by clusters
-        for (int i = 0; i < n_centroids; ++i) {
-            int list_size = invlists_size[i];  // actual list size, count by vectors
-            const int start_idx = i == 0 ? 0 : ivf_list_size_csum[i-1]; // start index of this list in the parse buffer
-
-            for (int j = 0; j < list_size; ++j) {
-                int kv_id = invlists[i * max_cluster_size + j];
-                memcpy(parse_value + (start_idx + j) * dim, values + kv_id * dim, dim * sizeof(uint16_t));
-                memcpy(parse_key + (start_idx + j) * dim, keys + kv_id * dim, dim * sizeof(uint16_t));
-            }
-        }
-    }
-
-    void construction_func(
+    void construct_func(
+        void* para
+        // int* clusters_ptr,       // (groups, n_centroids, max_cluster_size)
         // int* cluster_size_ptr    // (groups, n_centroids)
     ) {
-        int max_seq_len = 0;
-        for (int row = 0; row < group_num; ++row) {
-            int seq_len = parse_clusters(cluster_size_ptr + row * n_centroids, row);
-            last_seq_lengths[current_batch * group_num + row] = seq_len;
-            if (max_seq_len == 0) max_seq_len = seq_len;
-            else AT_ASSERT(max_seq_len == seq_len, "sequence length in one group is not equal.");
+        int thread_idx = reinterpret_cast<std::intptr_t>(para);
+        int _start = thread_idx * construct_groups_per_thread;
+        int _end = std::min((thread_idx + 1) * construct_groups_per_thread, process_groups);
+
+        for (int idx = _start; idx < _end; ++idx) {
+            auto cluster_descriptors_group = cluster_descriptors + (current_start_batch * group_num + idx) * static_cast<int64_t>(final_n_centroids);
+            int* invlists = clusters_ptr + idx * n_centroids * max_cluster_size;
+            int* invlists_size = cluster_size_ptr + idx * n_centroids;
+            uint16_t* values = input_value_ptr + idx * input_seq_length * dim;
+            uint16_t* keys = input_key_ptr + idx * input_seq_length * dim;
+            uint16_t* parse_key = ivf_key_array + (current_start_batch * group_num + idx) * output_seq_length * dim;
+            uint16_t* parse_value = ivf_value_array + (current_start_batch * group_num + idx) * output_seq_length * dim;
+
+            // organize keys & values by clusters
+            int start_idx = 0;
+            for (int i = 0; i < n_centroids; ++i) {
+                int list_size = invlists_size[i];  // actual list size, count by vectors
+                // calculate the number of blocks for this cluster
+                const int block_num = (list_size + block_size - 1) / block_size;
+
+                // initialize the cluster descriptor
+                cluster_descriptors_group[i].inBlockCache = false;
+                if (block_num > PRE_ALLOCATED_NUM) {
+                    delete[] cluster_descriptors_group[i].GPUBlockIDs;
+                    cluster_descriptors_group[i].GPUBlockIDs = new int[block_num];  // allocate larger memory
+                }
+                cluster_descriptors_group[i].CPUStartIndex = start_idx;
+                cluster_descriptors_group[i].BlockNum = block_num;
+                cluster_descriptors_group[i].LastBlockSize = list_size % block_size == 0 ? block_size : list_size % block_size;
+
+                // copy KV vectors
+                for (int j = 0; j < list_size; ++j) {
+                    int kv_id = invlists[i * max_cluster_size + j];
+                    memcpy(parse_value + (start_idx + j) * dim, values + kv_id * dim, dim * sizeof(uint16_t));
+                    memcpy(parse_key + (start_idx + j) * dim, keys + kv_id * dim, dim * sizeof(uint16_t));
+                }
+
+                start_idx += list_size;
+            }
+            last_seq_lengths[current_start_batch * group_num + idx] = start_idx;
         }
-        AT_ASSERT(static_cast<int64_t>(max_seq_len) <= input_seq_length, "Sum of the cluster sizes is larger than input sequence length.");
-        
+    }
+
+    void para_construct() {
+        // update the last_n_centroids
+        if (last_n_centroids == 0) {
+            last_n_centroids = n_centroids;  
+        } else {
+            AT_ASSERT(last_n_centroids == n_centroids, "n_centroids not equal in one batch.");
+        }
+
+        // count valid threads and groups per thread
+        int used_threads = std::min(num_threads, process_groups);
+        construct_groups_per_thread = (process_groups + used_threads - 1) / used_threads;
+
+        // submit construct job
         pool_->LockQueue();
-        for (int i = 0; i < group_num; ++i) {
-            pool_->QueueJobWOLock([this](void* para) { return this->organize_kv(para); }, 
+        for (int i = 0; i < used_threads; ++i) {
+            pool_->QueueJobWOLock([this](void* para) { return this->construct_func(para); }, 
                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
         }
-        pool_->AddNumTask(group_num);
+        pool_->AddNumTask(used_threads);
         pool_->UnlockQueue();
         pool_->NotifyAll();
     }
@@ -592,22 +579,18 @@ public:
     void async_construction(
         torch::Tensor& clusters,        // key id of each clusters, (groups, n_centroids, max_cluster_size), cpu int tensor
         torch::Tensor& cluster_size,    // cluster size of all clusters list, (groups, n_centroids), cpu int tensor
-        int batch_idx
+        int start_bdx
     ) {
         clusters_ptr = static_cast<int*>(clusters.data_ptr<int>());
         cluster_size_ptr = static_cast<int*>(cluster_size.data_ptr<int>());
+        process_groups = clusters.size(0);
+        n_centroids = clusters.size(1);
         max_cluster_size = clusters.size(2);
+        current_start_batch = start_bdx;
 
-        current_batch = batch_idx;
-
-        // const int input_groups = clusters.size(0);
-        // AT_ASSERT(input_groups == group_num, "Wrong group num of the vectors.");
-        // const int input_n_centroids = clusters.size(1);
-        // AT_ASSERT(input_n_centroids == n_centroids, "Wrong number of clusters.");
-
-        // submit parse job
+        // submit construct job
         pool_->LockQueue();
-        pool_->QueueJobWOLock([this](void* para) { return this->construction_func(); }, nullptr);
+        pool_->QueueJobWOLock([this](void* para) { return this->para_construct(); }, nullptr);
         pool_->AddNumTask(1);
         pool_->UnlockQueue();
         pool_->NotifyAll();
@@ -618,14 +601,6 @@ public:
     void construction_sync() {
         // wait for construction finish
         pool_->Wait();
-
-        if (current_batch == batch_size - 1) {
-            // free the memory
-            if (ivf_list_size_csum_array != nullptr) {
-                delete[] ivf_list_size_csum_array;
-                ivf_list_size_csum_array = nullptr;
-            }
-        }
         return;
     }
 
@@ -643,6 +618,7 @@ public:
         int _start = thread_idx * group_per_thread;
         int _end = std::min((thread_idx + 1) * group_per_thread, batch_groups);
 
+        // process each attention group
         for (int idx = _start; idx < _end; ++idx) {
             auto cluster_descriptors_group = cluster_descriptors + idx * static_cast<int64_t>(final_n_centroids) + last_n_centroids;
 
@@ -680,16 +656,17 @@ public:
 
                 start_idx += list_size;
             }
-            last_seq_lengths[idx] = start_idx;
+            last_seq_lengths[idx] = start_idx;  // update current sequence length for this group
         }
     }
 
     // parallel organize batch_groups keys & values by clustering results
     void update_kv(
-        torch::Tensor& update_keys,     // (batch_groups, update_seq_len, dim)
-        torch::Tensor& update_values,   // (batch_groups, update_seq_len, dim)
-        torch::Tensor& clusters,        // key id of each clusters, (batch_groups, update_n_centroids, max_cluster_size), cpu int tensor
-        torch::Tensor& cluster_size     // cluster size of all clusters list, (batch_groups, update_n_centroids), cpu int tensor
+        torch::Tensor& update_keys,         // (batch_groups, update_seq_len, dim)
+        torch::Tensor& update_values,       // (batch_groups, update_seq_len, dim)
+        torch::Tensor& clusters,            // key id of each clusters, (batch_groups, update_n_centroids, max_cluster_size), cpu int tensor
+        torch::Tensor& cluster_size,        // cluster size of all clusters list, (batch_groups, update_n_centroids), cpu int tensor
+        torch::Tensor& searched_clusters    // new searched cluster ids
     ) {
         if (update_keys.dtype() == torch::kFloat16) {     // fp16
             input_key_ptr = reinterpret_cast<uint16_t*>(update_keys.data_ptr<at::Half>());
@@ -716,7 +693,11 @@ public:
         pool_->NotifyAll();
         pool_->Wait();  // sync
 
-        last_n_centroids += n_centroids;
+        last_n_centroids += n_centroids;    // update current number of clusters
+
+        // update the searched clusters
+        searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
+        nprobe = searched_clusters.size(1);
     }
 
 
@@ -778,7 +759,7 @@ public:
     void para_batch_updata() {
         pool_->LockQueue();
         for (int i = 0; i < num_threads; ++i) {
-            pool_->QueueJobWOLock([this](void* para) { return this->batch_update(para); }, 
+            pool_->QueueJobWOLock([this](void* para) { this->batch_update(para); }, 
                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
         }
         pool_->AddNumTask(num_threads);
@@ -790,7 +771,7 @@ public:
         // create tasks
         pool_->LockQueue();
         for (int i = 0; i < num_threads; ++i) {
-            pool_->QueueJobWOLock([this](void* para) { return this->batch_access(para); }, 
+            pool_->QueueJobWOLock([this](void* para) { this->batch_access(para); }, 
                                   reinterpret_cast<void*>(static_cast<std::intptr_t>(i)));
         }
         pool_->AddNumTask(num_threads);
@@ -800,10 +781,10 @@ public:
 
         // submit aysnc update tasks
         pool_->LockQueue();
-        pool_->QueueJobWOLock([this](void* para) { return this->para_batch_updata(); }, nullptr);
+        pool_->QueueJobWOLock([this](void* para) { this->para_batch_updata(); }, nullptr);
         pool_->AddNumTask(1);
         pool_->UnlockQueue();
-        pool_->NotifyAll();
+        pool_->NotifyOne();
         
         return;
     }
@@ -822,8 +803,8 @@ namespace py = pybind11;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<WaveBufferCPU>(m, "WaveBufferCPU")
         .def(py::init<int, int, int, int, int, int, int, int, int, int, MyThreadPool*>(),
-             py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("block_size"), 
-             py::arg("n_centroids"), py::arg("final_n_centroids"), py::arg("buffer_size"), py::arg("capacity"), 
+             py::arg("batch_size"), py::arg("group_num"), py::arg("dim"), py::arg("nprobe"), py::arg("new_nprobe"),
+             py::arg("block_size"), py::arg("final_n_centroids"), py::arg("buffer_size"), py::arg("capacity"), 
              py::arg("threads"), py::arg("pool"))
         .def("set_indices", &WaveBufferCPU::set_indices, 
             py::arg("hit_block_ids"), py::arg("hit_block_sizes"), py::arg("hit_block_sizes_cumsum"), py::arg("hit_block_nums"),
@@ -833,10 +814,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("set_kv", &WaveBufferCPU::set_kv, 
             py::arg("ivf_key"), py::arg("ivf_value"), py::arg("input_keys"), py::arg("input_values"))
         .def("async_construction", &WaveBufferCPU::async_construction, 
-            py::arg("clusters"), py::arg("cluster_size"), py::arg("batch_idx"))
+            py::arg("clusters"), py::arg("cluster_size"), py::arg("start_bdx"))
         .def("construction_sync", &WaveBufferCPU::construction_sync)
         .def("update_kv", &WaveBufferCPU::update_kv, 
-            py::arg("update_keys"), py::arg("update_values"), py::arg("clusters"), py::arg("cluster_size"))
+            py::arg("update_keys"), py::arg("update_values"), py::arg("clusters"), py::arg("cluster_size"), py::arg("searched_clusters"))
         .def("batch_access", &WaveBufferCPU::para_batch_access)
         .def("sync", &WaveBufferCPU::sync);
     

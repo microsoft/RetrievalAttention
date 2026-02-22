@@ -21,12 +21,13 @@ rm -f "${RESULT_DIR}/${TASK}.jsonl"
 rm -f "${RESULT_DIR_E}/${TASK}.jsonl"
 
 echo "Start to predict..."
+# numactl --cpunodebind=0,1 python -u pred.py \
 python -u pred.py \
     --task ${TASK} \
     --attn_type ${ATTN_TYPE} \
     --model ${MODEL} \
     --dtype ${DTYPE} \
     --device auto \
-    --budget_ratio ${BUDGET_RATIO} \
-    --estimate_ratio ${ESTIMATE_RATIO} \
+    --retrieval_budget ${BUDGET_RATIO} \
+    --estimation_budget ${ESTIMATE_RATIO} \
     --num_examples ${NUM_EXAMPLES}

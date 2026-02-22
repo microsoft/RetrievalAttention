@@ -1,23 +1,13 @@
-from flash_attn import flash_attn_with_kvcache
-
-
-def retroinfer_prefill_attn(query_states, key_states, value_states, causal):
-
-    attn_out = flash_attn_with_kvcache(
-        q=query_states, 
-        k_cache=key_states, 
-        v_cache=value_states,
-        causal=causal
-    )
-    
-    return attn_out
-
 
 
 def retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, retroinfer_cache):
-    
-    attn_out = retroinfer_cache.compute(
-        query_states.contiguous(), layer_idx
-    )
-    
-    return attn_out
+    """
+    query_states: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
+    """
+    # assert query_states.size(0) == retroinfer_cache.batch_size
+    # assert query_states.size(1) == 1
+    # assert query_states.size(2) == retroinfer_cache.kv_head * retroinfer_cache.group_size == retroinfer_cache.num_heads
+    # assert query_states.size(3) == retroinfer_cache.head_dim
+
+    static_len = retroinfer_cache.static_pattern_total if layer_idx == retroinfer_cache.layer_num - 1 else retroinfer_cache.static_pattern_total + 1
+    return retroinfer_cache.attn_func(query_states.contiguous(), layer_idx, static_len)

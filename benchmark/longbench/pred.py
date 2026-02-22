@@ -7,14 +7,14 @@ from tqdm import tqdm
 import numpy as np
 import random
 import argparse
-import time
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.append(PROJECT_ROOT)
-from model_hub import LlamaModel, QwenModel
+from model_hub import LlamaModel, QwenModel, add_model_args
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from config import generate_config, parse_attn_args
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from config import add_config_args, generate_config
+
 
 model2path = json.load(open("config/model2path.json", "r"))
 model2maxlen = json.load(open("config/model2maxlen.json", "r"))
@@ -22,20 +22,18 @@ model2maxlen = json.load(open("config/model2maxlen.json", "r"))
 dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
 dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
 
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                     \
-                        choices=["Full_Flash_Attn", "RetroInfer"],                          \
-                        help="Attention method")
-    parser.add_argument('--model', type=str, default=None, choices=
-                        ["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"], help="Dtype")
+    # overwrite model_name argument
+    parser.add_argument('--model', type=str, default="llama-3-8b-1048k", 
+                        choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
     parser.add_argument('--task', type=str, required=True, help="task name. work when --e is false")
-    parser.add_argument("--device", type=str, default="auto", help="Device")
     parser.add_argument("--num_examples", type=int, default=-1, help="num of example to evaluate. -1 for all.")
 
-    parser = parse_attn_args(parser)
+    parser = add_model_args(parser)
+    parser = add_config_args(parser)
 
     return parser.parse_args(args)
 
@@ -52,25 +50,26 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, arg
             model2path[model_name], 
             input_ids.shape[1], 
             attn_type,
-            budget_ratio=args.budget_ratio,
-            estimate_ratio=args.estimate_ratio,
+            retrieval_budget=args.retrieval_budget,
+            estimation_budget=args.estimation_budget,
         )
 
         out = llm.generate(
             attention_type=attn_type,
-            inputs_ids = input_ids.to(llm.layers[0].device),
-            attention_masks = attention_masks.to(llm.layers[0].device),
+            inputs_ids=input_ids.to(llm.layers[0].device),
+            attention_masks=attention_masks.to(llm.layers[0].device),
             max_new_length=max_new_tokens, 
-            attn_config=attn_config
+            attn_config=attn_config,
+            do_sample=False,
+            ignore_eos=True
         )
 
         output = llm.tokenizer.batch_decode(out, skip_special_tokens=True)
-
-        torch.cuda.empty_cache()
-                
-        print("Chunked generation:", output[0][:50])
-
         pred = output[0]
+        
+        torch.cuda.empty_cache()
+        
+        print("Chunked generation:", pred[:50])
 
         with open(out_path, "a", encoding="utf-8") as f:
             json.dump(
@@ -84,6 +83,7 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, arg
                 ensure_ascii=False
             )
             f.write('\n')
+
 
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -115,15 +115,16 @@ def load_model(model_path, max_len, dtype, device):
     return llm
 
 
+
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
 
     num_examples = args.num_examples
     attn_type = args.attn_type
-    model_name = args.model # not hf model path
+    model_name = args.model
     device = args.device
-    dtype = torch.float16 if args.dtype == 'fp16' else torch.bfloat16
+    dtype = torch.float16 if args.dtype=='fp16' else torch.bfloat16
 
     max_length = model2maxlen[model_name]
     model_path = model2path[model_name]
@@ -135,9 +136,6 @@ if __name__ == '__main__':
             "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
     else:
         datasets = [args.task]
-        # datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
-        #             "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
-        #             "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
     
     # predict on each dataset
     if not os.path.exists("results/pred"):
@@ -146,15 +144,16 @@ if __name__ == '__main__':
         os.makedirs("results/pred_e")
 
     for dataset in datasets:
+        print(f"Predict {dataset}")
         if args.e:
-            data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+            data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True)
 
             prefix = f"results/pred_e/{model_name}/{attn_type}"
             if not os.path.exists(prefix):
                 os.makedirs(prefix)
             out_path = f"{prefix}/{dataset}.jsonl"
         else:
-            data = load_dataset('THUDM/LongBench', dataset, split='test')
+            data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True)
 
             prefix = f"results/pred/{model_name}/{attn_type}"
             if not os.path.exists(prefix):

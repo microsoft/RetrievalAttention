@@ -36,18 +36,24 @@ def _triton_assign_kernel(
     max_idx = tl.zeros([BLOCK_N], dtype=tl.int32)
 
     for start_k in tl.range(0, num_centroids, BLOCK_K):
-        x = tl.load(x_ptrs)                 # [BLOCK_D, BLOCK_K]
-        ip = tl.dot(k, x).to(tl.float32)    # [BLOCK_N, BLOCK_K]
-        tmp_max_val, tmp_max_idx = tl.max(ip, axis=1, return_indices=True)
+        # load centroids
+        k_mask = (start_k + offs_k) < num_centroids
+        x = tl.load(x_ptrs, mask=k_mask[None, :], other=0.) # [BLOCK_D, BLOCK_K]   
+        # compute inner product              
+        ip = tl.dot(k, x).to(tl.float32) # [BLOCK_N, BLOCK_K]
+        ip = tl.where(k_mask[None, :], ip, tl.zeros_like(ip) - float("inf"))
+        # get max value and index
+        tmp_max_val, tmp_max_idx = tl.max(ip, axis=1, return_indices=True) # [BLOCK_N,]
         tmp_max_idx += start_k
+        # update global max value and index
         max_idx = tl.where(tmp_max_val > max_val, tmp_max_idx, max_idx)
         max_val = tl.maximum(tmp_max_val, max_val)
+        # loop to the next block of centroids
         x_ptrs += BLOCK_K * stride_xk
 
     tl.store(m_ptrs, max_idx, mask=n_mask)
     tl.atomic_add(s_ptrs + max_idx[:, None] * stride_sk, k.to(tl.float32), mask=n_mask[:, None], sem='relaxed')
     tl.atomic_add(c_ptrs + max_idx * stride_ck, tl.zeros_like(max_idx) + 1, mask=n_mask, sem='relaxed')
-
 
 @triton.jit
 def _triton_update_kernel(
@@ -79,7 +85,6 @@ def _triton_update_kernel(
 
     tl.store(x_ptrs, x.to(X.type.element_ty), mask=x_mask)
 
-
 def _triton_k_means_train(
     data: torch.Tensor,             # [batch_size, num_tokens, dim]
     centroids: torch.Tensor,        # [batch_size, num_centroids, dim]
@@ -95,9 +100,7 @@ def _triton_k_means_train(
         max_idx = torch.empty((batch_size, num_tokens), dtype=torch.int32, device=data.device)
     # assert max_idx.shape == (batch_size, num_tokens)
     block_N = 128
-    block_K = 32
-    assert num_centroids % block_K == 0
-    # assert dim in [32, 64, 128]
+    block_K = 64
     _triton_assign_kernel[(triton.cdiv(num_tokens, block_N), batch_size, 1)](
         data, centroids, data_sum, data_cnt, max_idx,
         data.stride(0), data.stride(1), data.stride(2),
@@ -151,7 +154,6 @@ def _triton_reverse_index_kernel(
     cnt = tl.atomic_add(c_ptrs + max_idx * stride_ck, tl.zeros_like(max_idx) + 1, mask=n_mask, sem='relaxed')
     tl.store(i_ptrs + max_idx * stride_ik + cnt * stride_in, offs_n, mask=n_mask)
 
-
 def triton_reverse_index(
     max_idx: torch.Tensor,  # [batch_size, num_tokens]
     num_centroids: int,
@@ -201,7 +203,6 @@ def _triton_index_add_kernel(
 
     tl.atomic_add(s_ptrs + max_idx[:, None] * stride_sk, v.to(S.type.element_ty), mask=n_mask[:, None], sem='relaxed')
 
-
 def triton_index_add(
     value: torch.Tensor,    # [batch_size, num_tokens, head_dim]
     max_idx: torch.Tensor,  # [batch_size, num_tokens]
@@ -222,13 +223,13 @@ def triton_index_add(
 
 
 def segment_k_means(
-    key: torch.Tensor,    # [batch_size(=1)*num_heads, num_tokens, head_dim]
-    value: torch.Tensor,  # [batch_size(=1)*num_heads, num_tokens, head_dim]
+    key: torch.Tensor,    # [batch_size*kv_head_num, num_tokens, head_dim]
+    value: torch.Tensor,  # [batch_size*kv_head_num, num_tokens, head_dim]
     num_centroids: int,
     num_iters: int = 10,
     num_segments: int = 1
 ):
-    num_groups, num_tokens, head_dim = key.shape
+    _, num_tokens, head_dim = key.shape
 
     # initialize centroids uniformly
     centroid_indices = torch.arange(num_centroids, dtype=torch.float32, device=key.device) * (num_tokens / num_centroids)
@@ -252,8 +253,8 @@ def segment_k_means(
     value_sum = triton_index_add(value.reshape((-1, num_tokens, head_dim)), max_idx, num_centroids)
     clusters, cluster_size = triton_reverse_index(max_idx, num_centroids, max_cluster_size)
 
-    # centroids = centroids.reshape((batch_size*num_groups, num_centroids, head_dim))
-    # value_sum = value_sum.reshape((batch_size*num_groups, num_centroids, head_dim))
-    # clusters = clusters.reshape((batch_size*num_groups, num_centroids, max_cluster_size))
-    # cluster_size = cluster_size.reshape((batch_size*num_groups, num_centroids))
+    # centroids.reshape: (batch_size*kv_head_num, num_centroids, head_dim)
+    # value_sum.reshape: (batch_size*kv_head_num, num_centroids, head_dim)
+    # clusters.reshape: (batch_size*kv_head_num, num_centroids, max_cluster_size)
+    # cluster_size.reshape: (batch_size*kv_head_num, num_centroids)
     return centroids, value_sum, clusters, cluster_size

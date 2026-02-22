@@ -15,7 +15,7 @@
 
 
 if [ $# -ne 8 ]; then
-    echo "Usage: $0 <model_name> $1 <benchmark_name> $2 <attn_type> $3 <context length> $4 <task> $5 <dtype> $6 <budget_ratio> $7 <estimate_ratio>"
+    echo "Usage: $0 <model_name> $1 <prefill_method> $2 <attn_type> $3 <context length> $4 <task> $5 <dtype> $6 <budget_ratio> $7 <estimate_ratio>"
     exit 1
 fi
 
@@ -28,6 +28,7 @@ ATTN_TYPE=${3}
 DEVICE=auto
 BUDGET_RATIO=${7}
 ESTIMATE_RATIO=${8}
+PREFILL_METHOD=${2}
 
 # Model and Tokenizer
 source ruler_config_models.sh
@@ -41,7 +42,7 @@ fi
 
 # Benchmark and Tasks
 source ruler_config_tasks.sh
-BENCHMARK=${2}
+BENCHMARK=synthetic
 declare -n TASKS=$BENCHMARK
 if [ -z "${TASKS}" ]; then
     echo "Benchmark: ${BENCHMARK} is not supported"
@@ -49,10 +50,11 @@ if [ -z "${TASKS}" ]; then
 fi
 
 # Start client (prepare data / call model API / obtain final metrics)
-    
 RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}"
 DATA_DIR="${RESULTS_DIR}/data"
 PRED_DIR="${RESULTS_DIR}/pred"
+rm -rf ${DATA_DIR}
+rm -rf ${PRED_DIR}
 mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 
@@ -69,6 +71,7 @@ python -u data/prepare.py \
     ${REMOVE_NEWLINE_TAB}
 
 DTYPE=${6}
+# numactl --cpunodebind=0,1 python -u pred/call_api.py \
 python -u pred/call_api.py \
     --model_name ${MODEL_NAME} \
     --attn_type ${ATTN_TYPE} \
@@ -81,11 +84,11 @@ python -u pred/call_api.py \
     --dtype ${DTYPE} \
     --server_type ${MODEL_FRAMEWORK} \
     --device ${DEVICE} \
-    --budget_ratio ${BUDGET_RATIO} \
-    --estimate_ratio ${ESTIMATE_RATIO} \
+    --retrieval_budget ${BUDGET_RATIO} \
+    --estimation_budget ${ESTIMATE_RATIO} \
     --synthetic_len ${MAX_SEQ_LENGTH} \
+    --prefill_method ${PREFILL_METHOD}
 
 python -u eval/evaluate.py \
     --data_dir ${PRED_DIR} \
     --benchmark ${BENCHMARK}
-

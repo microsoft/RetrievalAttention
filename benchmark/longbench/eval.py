@@ -39,12 +39,21 @@ dataset2metric = {
     "repobench-p": code_sim_score,
 }
 
+sub_categories = {
+    "Single-Document QA": ["qasper", "multifieldqa_en", "narrativeqa"],
+    "Multi-Document QA": ["hotpotqa", "2wikimqa", "musique", "dureader"],
+    "Summarization": ["gov_report", "qmsum", "multi_news", "vcsum"],
+    "Few-shot learning": ["trec", "lsht", "samsum", "triviaqa"],
+    "Synthetic tasks": ["passage_retrieval_en", "passage_count", "passage_retrieval_zh"],
+    "Code Completion": ["repobench-p", "lcc"]
+}
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default=None, choices=
-                        ["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
-    parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                     \
-                        choices=["Full_Flash_Attn", "RetroInfer"],                          \
+    parser.add_argument('--model', type=str, default=None, 
+                        choices=["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
+    parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",
+                        choices=["Full_Flash_Attn", "RetroInfer"],
                         help="Attention method")
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
     return parser.parse_args(args)
@@ -114,7 +123,22 @@ if __name__ == '__main__':
             score = scorer(dataset, predictions, answers, all_classes)
         scores[dataset] = score
     
+    print(f"\n\nAverage scores of sub-categories:")
+    for category, sub_tasks in sub_categories.items():
+        sub_scores = []
+        existed_sub_tasks = []
+        for sub_task in sub_tasks:
+            if sub_task in scores:
+                existed_sub_tasks.append(sub_task)
+                sub_scores.append(float(scores[sub_task]))
+        
+        if len(existed_sub_tasks) == 0:
+            continue
+        
+        avg_score = sum(sub_scores) / len(sub_scores)
+        print(f"{category} - {existed_sub_tasks} - average score: {avg_score:.2f}")
 
+    print(f"\n")
     out_path = f"{path}result.json"
 
     with open(out_path, "w") as f:
