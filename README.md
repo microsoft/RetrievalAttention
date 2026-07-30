@@ -195,14 +195,15 @@ This repository provides a flexible inference framework that allows users to eas
 ## :bulb: Reference
 If you find this project helpful, please cite our papers:
 ```bibtex
-@misc{chen2025retroinfervectorstorageapproachscalable,
-    title={RetroInfer: A Vector-Storage Approach for Scalable Long-Context LLM Inference}, 
-    author={Yaoqi Chen and Jinkai Zhang and Baotong Lu and Qianxi Zhang and Chengruidong Zhang and Jingjia Luo and Di Liu and Huiqiang Jiang and Qi Chen and Jing Liu and Bailu Ding and Xiao Yan and Jiawei Jiang and Chen Chen and Mingxing Zhang and Yuqing Yang and Fan Yang and Mao Yang},
-    year={2025},
-    eprint={2505.02922},
-    archivePrefix={arXiv},
-    primaryClass={cs.LG},
-    url={https://arxiv.org/abs/2505.02922}, 
+@article{chen2026retroinfer,
+  title={RetroInfer: A Vector Storage Engine for Scalable Long-Context LLM Inference},
+  author={Chen, Yaoqi and Zhang, Jinkai and Lu, Baotong and Zhang, Qianxi and Zhang, Chengruidong and Liu, Jing and Luo, Jingjia and Liu, Di and Jiang, Huiqiang and Chen, Qi and others},
+  journal={Proceedings of the VLDB Endowment},
+  volume={19},
+  number={5},
+  pages={1016--1031},
+  year={2026},
+  publisher={VLDB Endowment}
 }
 
 @misc{liu2024retrievalattentionacceleratinglongcontextllm,
