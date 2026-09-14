@@ -206,14 +206,13 @@ If you find this project helpful, please cite our papers:
   publisher={VLDB Endowment}
 }
 
-@misc{liu2024retrievalattentionacceleratinglongcontextllm,
-      title={RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval}, 
-      author={Di Liu and Meng Chen and Baotong Lu and Huiqiang Jiang and Zhenhua Han and Qianxi Zhang and Qi Chen and Chengruidong Zhang and Bailu Ding and Kai Zhang and Chen Chen and Fan Yang and Yuqing Yang and Lili Qiu},
-      year={2024},
-      eprint={2409.10516},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2409.10516}, 
+@article{liu2026retrievalattention,
+  title={Retrievalattention: Accelerating long-context llm inference via vector retrieval},
+  author={Liu, Di and Chen, Meng and Lu, Baotong and Jiang, Huiqiang and Han, Zhenhua and Zhang, Qianxi and Chen, Qi and Zhang, Chengruidong and Ding, Bailu and Zhang, Kai and others},
+  journal={Advances in Neural Information Processing Systems},
+  volume={38},
+  pages={54358--54385},
+  year={2026}
 }
 ```
 
